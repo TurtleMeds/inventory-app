@@ -8,10 +8,18 @@ import {
   ScrollView,
   FlatList,
   Keyboard,
-  TouchableWithoutFeedback,
+  useColorScheme,
+  Pressable,
+  LogBox,
+  KeyboardAvoidingView,
+  Platform,
 } from 'react-native';
+import Fuse, { FuseResult } from 'fuse.js'
 import TextInput from '../components/TextInput'
+import { KeyboardAwareScrollView } from 'react-native-keyboard-aware-scroll-view'
 import { Picker } from '@react-native-picker/picker';
+import { useLocalSearchParams, useNavigation } from 'expo-router';
+import { toast, ToastContainer } from 'expo-toastee'
 import * as Clipboard from 'expo-clipboard';
 import * as FileSystem from 'expo-file-system';
 import * as Sharing from 'expo-sharing';
@@ -20,60 +28,161 @@ import Papa from 'papaparse';
 import {
   Tree,
   NewTreeForm,
-  SearchType,
+  Inventory,
   City,
+  Seattle,
+  Bellevue,
+  Kirkland,
+  Redmond,
+  Sammamish,
   TreeType,
-  styles,
+  getStyles,
+  InventoryIndex,
 } from './lib'
+import SiteSettings from '@/components/SiteSettings';
 
-// Custom component for the table header.
-const TableHeader: React.FC = () => (
-  <View style={styles.tableRowHeader}>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 0.5 }]}>#</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 1.5 }]}>Common Name</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 1.5 }]}>Species</Text>
-    <Text style={[styles.tableCell, styles.headerText]}>DSH</Text>
-    <Text style={[styles.tableCell, styles.headerText]}>DLR</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 0.8 }]}>Tier</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 0.8 }]}>Cond</Text>
-    <Text style={[styles.tableCell, styles.headerText]}>TPZ</Text>
-    <Text style={[styles.tableCell, styles.headerText]}>ITPZ</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 0.8 }]}>Retain</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 2 }]}>NOTES</Text>
-    <Text style={[styles.tableCell, styles.headerText, { flex: 0.8 }]}>Actions</Text>
-  </View>
-);
+  LogBox.ignoreLogs(['VirtualizedLists should never be nested']);
 
 // Main App component
-const Inventory: React.FC = () => {
+const InventoryPage: React.FC = () => {
 
   const MIN_TPZ_FEET = 5;
 
-  const [city, setCity] = useState<City>();
-  const [searchType, setSearchType] = useState<SearchType>();
+  const systemTheme = useColorScheme();
+  const [darkMode, setDarkMode] = useState<boolean>(systemTheme === 'dark')
+  const styles = getStyles(darkMode);
+
+  const [isDirty, setIsDirty] = useState<boolean>(false);
+
+  const markDirty = () => {
+    if (!isDirty) {
+      setIsDirty(true)
+      console.log("dirty");
+    };
+  };
+  // Navigation
+  const navigation = useNavigation();
+
+  // Effect
+  useEffect(() => { 
+    const listener = navigation.addListener('beforeRemove', (e) => {
+      e.preventDefault();
+      if (isDirty) {
+        Alert.alert(
+          "Unsaved changes",
+          "You have unsaved changes. Do you want to save before leaving?",
+          [
+            {
+              text: "Don't save",
+              style: "destructive",
+              onPress: () => navigation.dispatch(e.data.action),
+            },
+            { text: "Cancel", style: "cancel" },
+            {
+              text: "Save",
+              onPress: () => {
+                saveInventory();
+                navigation.dispatch(e.data.action);
+              },
+            },
+          ]
+        );
+      }
+      navigation.dispatch(e.data.action);
+    });
+
+    return () => {
+      navigation.removeListener('beforeRemove', listener);
+    };
+  }, []);
+
+  const { invId } = useLocalSearchParams();
+  const [id, setId] = useState<number>(-1);
+  const [loaded, setLoaded] = useState<boolean>(true);
+
+  useEffect(() => {
+    const fetchId = async () => {
+      try {
+        // Case 1: ID comes from URL
+        if (invId) {
+          console.log("got invId: " + invId)
+          const parsedId = parseInt(invId.toString());
+          if (!isNaN(parsedId)) {
+            setId(parsedId);
+            setLoaded(false);
+            return;
+          }
+        }
+
+        console.log("got no invid");
+
+        // Case 2: Generate new ID
+        let id = 0;
+        let highestId = 0;
+        const defaultIndex: InventoryIndex = { inventories: [{ id: 0, address: "", latest: "" }] };
+        const documentDirectory = `${FileSystem.documentDirectory}`;
+        const indexPath = `${documentDirectory}inventoryIndex.json`;
+
+        const entries = await FileSystem.readDirectoryAsync(documentDirectory);
+
+        let index: InventoryIndex = defaultIndex;
+
+        if (entries.includes("inventoryIndex.json")) {
+          const text = await FileSystem.readAsStringAsync(indexPath);
+          index = JSON.parse(text);
+          index.inventories.forEach((inventory) => {
+            highestId = Math.max(highestId, inventory.id);
+          });
+          id = highestId + 1;
+          index.inventories.push({ id, address: "", latest: "" });
+        }
+
+        await FileSystem.writeAsStringAsync(indexPath, JSON.stringify(index));
+        setId(id);
+      } catch (error) {
+        toast.error(error instanceof Error ? error.message : String(error));
+      }
+    };
+
+    fetchId();
+  }, [invId]);
+
+  const cities: Record<string, City> = {
+    Seattle,
+    Bellevue,
+    Kirkland,
+    Redmond,
+    Sammamish,
+  };
+
+  const [cityName, setCityName] = useState("Seattle");
+  const [searchType, setSearchType] = useState<string>('Common Name');
+  const [date, setDate] = useState<string>(new Date().toLocaleString('en-US', { timeZone: "America/Los_Angeles" }).split(",")[0].replaceAll("/", "-"))
+
   
   // State for general site information.
   const [address, setAddress] = useState<string>('');
   const [siteNotes, setSiteNotes] = useState<string>(`This site will need tree protection for adjacent trees.
 Add TPZ and ITPZ to your site plan.
-Tree protection fencing must be shown on the plan and must be outside of the ITPZ of all trees.`);
+Tree protection fencing must be shown on the plan and must be outside of the ITPZ of all trees.
+Tree locations must be verified by survey.`);
 
-  const [expanded, setExpanded] = useState<boolean>(false);
 
   // State for the main tree inventory table.
   const [trees, setTrees] = useState<Tree[]>([]);
 
   // State for the autocomplete
-  const [suggestions, setSuggestions] = useState<TreeType[]>([]);
+  const [suggestions, setSuggestions] = useState<FuseResult<TreeType>[]>([]);
 
   // State for the new tree form input.
   const [newTree, setNewTree] = useState<NewTreeForm>({
     treeType: 'Onsite',
+    search: '',
     commonName: '',
     species: '',
     dsh: '',
     dlr: '',
-    tier: '',
+    class: '',
     cond: '',
     tpz: '',
     itpz: '',
@@ -90,15 +199,56 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
   const [showEmailModal, setShowEmailModal] = useState<boolean>(false);
   const [emailContent, setEmailContent] = useState<string>('');
 
-  // Function to calculate Tier based on DSH.
-  const calculateTier = (dshValue: string): string => {
-    const dsh = parseFloat(dshValue);
-    if (isNaN(dsh)) return '';
-    if (dsh <= 12) return '4';
-    if (dsh <= 24) return '3';
-    if (dsh > 24) return '2';
-    return '';
-  };
+  const documentDirectory = `${FileSystem.documentDirectory}`;
+  const indexPath = `${documentDirectory}inventoryIndex.json`;
+
+  useEffect(() => {
+    const loadFromSave = async (id: number) => {
+      const index: InventoryIndex = JSON.parse(
+        await FileSystem.readAsStringAsync(indexPath)
+      );
+      console.log(index);
+
+      for (const inventory of index.inventories) {
+        console.log(inventory.id, " ", inventory.id == id);
+        if (inventory.id == id) {
+          console.log("if statement passed");
+          console.log(inventory.latest);
+          const latest = await FileSystem.getInfoAsync(inventory.latest).catch(console.error);
+          console.log("latest", latest);
+
+          if (latest?.exists) {
+            let loadpath = inventory.latest;
+            console.log("found match");
+            let loadedInventory: Inventory = JSON.parse(
+              await FileSystem.readAsStringAsync(loadpath)
+            );
+
+            setAddress(loadedInventory.address);
+            setTrees(loadedInventory.trees);
+            setNewTree(loadedInventory.newTree);
+            setSiteNotes(loadedInventory.siteNotes);
+            setCityName(loadedInventory.cityName);
+            setSearchType(loadedInventory.searchType);
+          }
+        }
+      }
+
+      setLoaded(true);
+    };
+
+    if (!loaded) loadFromSave(id);
+  }, [id]);
+
+  const [fuse, setFuse] = useState<Fuse<TreeType>>(new Fuse(treeList, {
+    keys: [searchType]
+  }));
+
+  useEffect(() => {
+    setFuse(new Fuse(treeList, {
+      keys: [searchType]
+    }))
+  }, [searchType])
 
   // Function to calculate TPZ and ITPZ based on DLR (and DSH if DLR is missing).
   const calculateProtectionZones = (dshValue: string, dlrValue: string) => {
@@ -127,21 +277,13 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
   useEffect(() => {
     const { dsh, dlr, treeType } = newTree;
 
-    if (treeType === 'Onsite') {
-      const autoTier = calculateTier(dsh);
-      setNewTree((prevTree) => ({ ...prevTree, tier: autoTier }));
-    } else if (treeType === 'ROW') {
-      setNewTree((prevTree) => ({ ...prevTree, tier: 'ROW' }));
-    } else {
-      if (newTree.tier !== '') {
-        setNewTree((prevTree) => ({ ...prevTree, tier: '' }));
-      }
-    }
+    const autoClass = cities[cityName].classFunction(parseFloat(newTree.dsh), newTree.commonName, newTree.species, newTree.treeType);
+    setNewTree((prevTree) => ({ ...prevTree, class: autoClass }));
 
     const { tpz, itpz } = calculateProtectionZones(dsh, dlr);
     setNewTree((prevTree) => ({ ...prevTree, tpz, itpz }));
 
-  }, [newTree.dsh, newTree.dlr, newTree.treeType]);
+  }, [newTree.dsh, newTree.dlr, newTree.treeType, cityName]);
 
   // Effect to auto-fill DSH for multistem trees.
   useEffect(() => {
@@ -154,17 +296,9 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
     }
   }, [newTree.isMultistem, newTree.stemDSHs]);
 
-  const handleExpand = () => {
-    setExpanded(!expanded);
-  }
-
-  const handleAutocomplete = (name: string) => {
+  const handleAutocomplete = (tree: TreeType) => {
     Keyboard.dismiss();
-    setNewTree(prevTree => ({ ...prevTree, commonName: name}));
-    const match = treeList.find(tree => tree["Common Name"] == name);
-    if (match) {
-      setNewTree(prevTree => ({ ...prevTree, species: match["Scientific Name"]}));
-    }
+    setNewTree(prevTree => ({ ...prevTree, species: tree['Scientific Name'], commonName: tree['Common Name']}));
   }
 
 
@@ -174,16 +308,15 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
       ...prevTree,
       [name]: value,
     }));
-    if (name === 'commonName') {
+    if (name === 'search') {
       if (value.trim().length > 0) {
-        const filtered = treeList.filter((item) =>
-          item['Common Name'].toLowerCase().includes(value.toLowerCase())
-        );
+        const filtered = fuse.search(value);
         setSuggestions(filtered);
       } else {
         setSuggestions([]);
       }
     }
+    markDirty();
   };
 
   // Handler for multistem checkbox.
@@ -194,6 +327,7 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
       stemDSHs: !prevTree.isMultistem ? [] : prevTree.stemDSHs, // Clear stems if unchecked
       dsh: !prevTree.isMultistem ? '' : prevTree.dsh, // Clear DSH if unchecked
     }));
+    markDirty();
   };
 
   // Handler for adding a new stem DSH.
@@ -206,6 +340,7 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
       }));
       setCurrentStemDSH('');
     }
+    markDirty();
   };
 
   // Function to remove a stem DSH.
@@ -214,6 +349,7 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
       ...prevTree,
       stemDSHs: prevTree.stemDSHs.filter((_, index) => index !== indexToRemove),
     }));
+    markDirty();
   };
 
   // Function to add a new tree to the inventory.
@@ -222,11 +358,12 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
       setTrees((prevTrees) => [...prevTrees, { ...newTree, id: Date.now(), stemDSHs: newTree.stemDSHs }]);
       setNewTree({
         treeType: 'Onsite',
+        search: '',
         commonName: '',
         species: '',
         dsh: '',
         dlr: '',
-        tier: '',
+        class: '',
         cond: '',
         tpz: '',
         itpz: '',
@@ -235,20 +372,72 @@ Tree protection fencing must be shown on the plan and must be outside of the ITP
         isMultistem: false,
         stemDSHs: [],
       });
+      markDirty();
       setCurrentStemDSH('');
+    }
+  };
+  const editTree = (id: number) => {
+    const treeToEdit = trees.find(t => t.id === id);
+    if (treeToEdit) {
+      setNewTree(treeToEdit);
+      deleteTree(id)
+      // Optionally scroll to "Add New Tree" form so user can edit it
     }
   };
 
   // Function to delete a tree from the inventory.
   const deleteTree = (id: number) => {
     setTrees((prevTrees) => trees.filter((tree) => tree.id !== id));
+    markDirty();
   };
+
+  const saveInventory = () => {
+    const inventory: Inventory = {
+      id: id,
+      trees: trees,
+      searchType: searchType,
+      date: date,
+      cityName: cityName,
+      siteNotes: siteNotes,
+      newTree: newTree,
+      address: address
+    }
+
+    const path = `${FileSystem.documentDirectory}${address.replaceAll(" ", "_")}, ${date}.arbor`;
+    console.log(`current path: ${path}
+      current id: ${id}`)
+
+    FileSystem.writeAsStringAsync(path, JSON.stringify(inventory))
+      .then(() => {
+        toast.success("The inventory was saved!");
+        updateInventoryIndex(path);
+        setIsDirty(false);
+      }, (error) => {toast.error(error)});
+  };
+
+  const updateInventoryIndex = (latest: string) => {
+    FileSystem.readAsStringAsync(indexPath).then((text) => {
+      let index: InventoryIndex = JSON.parse(text);
+      index.inventories.forEach(
+        (inventory) => {
+          if (inventory.id == id) {
+            console.log(`latest: ${latest}, address: ${address}`);
+            inventory.latest = latest;
+            inventory.address = address;
+          }
+        }
+      );
+      FileSystem.writeAsStringAsync(indexPath, JSON.stringify(index)).then(() => {
+        console.log(`Successfully updated ${indexPath}`);
+      });
+    }, (error) => {toast.error(error)})
+  }
 
   // Function to export tree data to CSV - Placeholder for React Native.
   const exportToCsv = async () => {
     const csvContent = Papa.unparse(trees);
     try {
-      const path = `${FileSystem.documentDirectory}tree table for ${address}.csv`;
+      const path = `${FileSystem.cacheDirectory}Tree table for ${address} ${date}.csv`;
       await FileSystem.writeAsStringAsync(path, csvContent);
       if (await Sharing.isAvailableAsync()) {
         Sharing.shareAsync(path);
@@ -274,7 +463,7 @@ const generateEmail = () => {
 
   trees.forEach(tree => {
     if (tree.treeType === 'Onsite') {
-      switch (tree.tier) {
+      switch (tree.class) {
         case '1': calculatedTierCounts.tier1++; break;
         case '2': calculatedTierCounts.tier2++; break;
         case '3': calculatedTierCounts.tier3++; break;
@@ -288,23 +477,28 @@ const generateEmail = () => {
     }
   });
 
-  let plainTextEmailBody = `
+  let plainEmailContent = `
 Address: ${address}
-
+<br/>
+<br/>
 Summary of trees:
-- Tier 1 = ${calculatedTierCounts.tier1}
-- Tier 2 = ${calculatedTierCounts.tier2}
-- Tier 3 = ${calculatedTierCounts.tier3}
-- Tier 4 = ${calculatedTierCounts.tier4}
-- ROW = ${calculatedTierCounts.row}
-- Adjacent = ${calculatedTierCounts.adjacent}
-- Groves = ${calculatedTierCounts.groves}
+<br/>
+<ul>
+<li>Tier 1 = ${calculatedTierCounts.tier1}</li>
+<li>Tier 2 = ${calculatedTierCounts.tier2}</li>
+<li>Tier 3 = ${calculatedTierCounts.tier3}</li>
+<li>Tier 4 = ${calculatedTierCounts.tier4}</li>
+<li>ROW = ${calculatedTierCounts.row}</li>
+<li>Adjacent = ${calculatedTierCounts.adjacent}</li>
+<li>Groves = ${calculatedTierCounts.groves}</li>
+</ul>
+<br/>
 `;
 
   // one combined HTML table
   const generateHTMLTable = (sections: { title: string; trees: Tree[]; type: string }[]) => {
     let tableHTML = `
-      <table border="1" cellspacing="0" cellpadding="4" style="border-collapse: collapse; width: 100%; margin-top: 12px;">
+      <table border="1" cellspacing="0" cellpadding="4" style="border-collapse: collapse; margin-top: 12px;">
         <thead>
           <tr>
             <th>Tree #</th>
@@ -329,7 +523,7 @@ Summary of trees:
       // section header row inside table
       tableHTML += `
         <tr>
-          <td colspan="11" style="font-weight: bold; background-color: #f3f4f6; text-align: left;">${title}</td>
+          <td colspan="11" style="font-weight: bold; text-align: left;">${title}</td>
         </tr>
       `;
 
@@ -356,7 +550,7 @@ Summary of trees:
             <td>${tree.species || ''}</td>
             <td>${tree.dsh || ''}</td>
             <td>${tree.dlr || ''}</td>
-            <td>${tree.tier || ''}</td>
+            <td>${tree.class || ''}</td>
             <td>${tree.cond || ''}</td>
             <td>${tree.tpz || ''}</td>
             <td>${tree.itpz || ''}</td>
@@ -378,15 +572,13 @@ Summary of trees:
   const onsiteTrees = trees.filter(tree => tree.treeType === 'Onsite');
   const adjacentTrees = trees.filter(tree => tree.treeType === 'Adjacent');
 
-  plainTextEmailBody += generateHTMLTable([
+  plainEmailContent += `\n\nSite Notes:\n${siteNotes}`.replaceAll("\n", "<br/>");
+  plainEmailContent += generateHTMLTable([
     { title: 'ROW (Right of Way) Trees', trees: rowTrees, type: 'ROW' },
     { title: 'Onsite Trees', trees: onsiteTrees, type: 'Onsite' },
     { title: 'Adjacent Trees', trees: adjacentTrees, type: 'Adjacent' },
   ]);
-
-  plainTextEmailBody += `\n\nSite Notes:\n${siteNotes}`;
-
-  setEmailContent(plainTextEmailBody);
+  setEmailContent(plainEmailContent);
   setShowEmailModal(true);
 };
 
@@ -398,6 +590,7 @@ Summary of trees:
   };
 
   const renderTreeTable = (treeList: Tree[], title: string, prefix: string) => {
+
     if (treeList.length === 0) {
       return (
         <View style={styles.tableContainer}>
@@ -406,41 +599,78 @@ Summary of trees:
         </View>
       );
     }
+
     return (
       <View style={styles.tableContainer}>
         <Text style={styles.sectionTitle}>{title}</Text>
-        <View style={styles.tableWrapper}>
-          <View>
-            <TableHeader />
+
+        <ScrollView
+          horizontal={true}
+          scrollEventThrottle={16}
+          bounces
+          nestedScrollEnabled={true}
+          showsHorizontalScrollIndicator={false} // hide default
+          contentContainerStyle={{ flexGrow: 1 }}
+        >
+        <Pressable>
+          <View >
+            {/* Header */}
+            <View style={styles.tableRowHeader}>
+              <Text style={[styles.tableCell, styles.tableCellNumber, styles.headerText]}>#</Text>
+              <Text style={[styles.tableCell, styles.tableCellActions, styles.headerText]}>Edit</Text>
+              <Text style={[styles.tableCell, styles.tableCellCommonName, styles.headerText]}>Common Name</Text>
+              <Text style={[styles.tableCell, styles.tableCellSpecies, styles.headerText]}>Species</Text>
+              <Text style={[styles.tableCell, styles.tableCellDSH, styles.headerText]}>DSH</Text>
+              <Text style={[styles.tableCell, styles.tableCellDLR, styles.headerText]}>DLR</Text>
+              <Text style={[styles.tableCell, styles.tableCellTier, styles.headerText]}>{cities[cityName].className}</Text>
+              <Text style={[styles.tableCell, styles.tableCellCond, styles.headerText]}>Cond</Text>
+              <Text style={[styles.tableCell, styles.tableCellTPZ, styles.headerText]}>TPZ</Text>
+              <Text style={[styles.tableCell, styles.tableCellITPZ, styles.headerText]}>ITPZ</Text>
+              <Text style={[styles.tableCell, styles.tableCellRetain, styles.headerText]}>Retain</Text>
+              <Text style={[styles.tableCell, styles.tableCellNotes, styles.headerText]}>Notes</Text>
+              <Text style={[styles.tableCell, styles.tableCellActions, styles.headerText]}>Delete</Text>
+            </View>
+
+            {/* Rows */}
             {treeList.map((tree, index) => (
               <View key={tree.id} style={styles.tableRow}>
-                <Text style={[styles.tableCell, { flex: 0.5 }]}>
+                <Text style={[styles.tableCell, styles.tableCellNumber]}>
                   {prefix === 'Onsite-' ? `${index + 1}` : prefix === 'ROW-' ? `ROW-${index + 1}` : `${String.fromCharCode(65 + index)}`}
                 </Text>
-                <Text style={[styles.tableCell, { flex: 1.5 }]}>{tree.commonName}</Text>
-                <Text style={[styles.tableCell, { flex: 1.5 }]}>{tree.species}</Text>
-                <Text style={styles.tableCell}>{tree.dsh}</Text>
-                <Text style={styles.tableCell}>{tree.dlr}</Text>
-                <Text style={[styles.tableCell, { flex: 0.8 }]}>{tree.tier}</Text>
-                <Text style={[styles.tableCell, { flex: 0.8 }]}>{tree.cond}</Text>
-                <Text style={styles.tableCell}>{tree.tpz}</Text>
-                <Text style={styles.tableCell}>{tree.itpz}</Text>
-                <Text style={[styles.tableCell, { flex: 0.8 }]}>{tree.retain}</Text>
-                <Text style={[styles.tableCell, { flex: 2 }]}>{tree.notes}</Text>
-                <TouchableOpacity
-                  onPress={() => deleteTree(tree.id)}
-                  style={styles.deleteButton}
-                >
-                  <Text style={styles.deleteButtonText}>Delete</Text>
-                </TouchableOpacity>
+                <View style={[styles.tableCell, styles.tableCellActions, { flexDirection: 'row', gap: 4 }]}>
+                  <TouchableOpacity
+                    onPress={() => editTree(tree.id)}
+                    style={[styles.actionButton, styles.editButton]}
+                  >
+                    <Text style={styles.actionButtonText}>Edit</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={[styles.tableCell, styles.tableCellCommonName]}>{tree.commonName}</Text>
+                <Text style={[styles.tableCell, styles.tableCellSpecies]}>{tree.species}</Text>
+                <Text style={[styles.tableCell, styles.tableCellDSH]}>{tree.dsh}</Text>
+                <Text style={[styles.tableCell, styles.tableCellDLR]}>{tree.dlr}</Text>
+                <Text style={[styles.tableCell, styles.tableCellTier]}>{tree.class}</Text>
+                <Text style={[styles.tableCell, styles.tableCellCond]}>{tree.cond}</Text>
+                <Text style={[styles.tableCell, styles.tableCellTPZ]}>{tree.tpz}</Text>
+                <Text style={[styles.tableCell, styles.tableCellITPZ]}>{tree.itpz}</Text>
+                <Text style={[styles.tableCell, styles.tableCellRetain]}>{tree.retain}</Text>
+                <Text style={[styles.tableCell, styles.tableCellNotes]}>{tree.notes}</Text>
+                <View style={[styles.tableCell, styles.tableCellActions, { flexDirection: 'row', gap: 4 }]}>
+                  <TouchableOpacity
+                    onPress={() => deleteTree(tree.id)}
+                    style={[styles.actionButton, styles.deleteButton]}
+                  >
+                    <Text style={styles.actionButtonText}>Delete</Text>
+                  </TouchableOpacity>
+                </View>
               </View>
             ))}
           </View>
-        </View>
+        </Pressable>
+        </ScrollView>
       </View>
     );
   };
-
   const dismissAll = () => {
     Keyboard.dismiss();
     setSuggestions([]);
@@ -449,259 +679,242 @@ Summary of trees:
   const rowTrees = trees.filter(tree => tree.treeType === 'ROW');
   const adjacentTrees = trees.filter(tree => tree.treeType === 'Adjacent');
 
+  if (id == -1) {
+    console.log("waiting for id");
+    return (
+      <View style={styles.card}>
+        <Text style={styles.title}>Loading...</Text>
+        <ToastContainer/>
+      </View>
+    );
+  }
   return (
-    <TouchableWithoutFeedback onPress={dismissAll} accessible={false}>
-    <ScrollView keyboardShouldPersistTaps='handled' showsVerticalScrollIndicator={false} style={styles.card}>
-      <Text style={styles.title}>Tree Inventory</Text>
-      
-      {/* Address Input */}
-
-      <View style={styles.formContainer}>
-        <TouchableOpacity onPress={handleExpand}>
-          <Text
-            style={[styles.sectionTitle, {marginBottom: expanded ? 12 : 0}]}
-          >
-            {expanded ? "Site Settings ▲" : "Site Settings ▼"}
-          </Text>
-        </TouchableOpacity>
-        {expanded && (
-          <View>
-            <View style={styles.formGroup}>
-              <TextInput
-                title="Address"
-                value={address}
-                onChangeText={setAddress}
-              />
-            </View>
-            <Text style={styles.label}>City:</Text>
-            <View style={styles.pickerContainer}>
-              <Picker
-                style={styles.picker}
-                onValueChange={setCity}
-              >
-                <Picker.Item label="Seattle" value="Seattle"/>
-                <Picker.Item label="Bellevue" value="Bellevue"/>
-                <Picker.Item label="Kirkland" value="Kirkland"/>
-                <Picker.Item label="Redmond" value="Redmond"/>
-                <Picker.Item label="Sammamish" value="Sammamish"/>
-              </Picker>
-            </View>
-            <Text style={styles.label}>Search by...</Text>
-            <View style={styles.pickerContainer}>
-              <Picker
-                style={styles.picker}
-                onValueChange={setSearchType}
-              >
-                <Picker.Item label="Common Name" value="Common Name"/>
-                <Picker.Item label="Tree Code" value="Tree Code"/>
-                <Picker.Item label="Scientific Name" value="Scientific Name"/>
-              </Picker>
-            </View>
-          </View>
-        )}
-      </View>
-
-      {/* Add New Tree Form */}
-      <View style={styles.formContainer}>
-        <Text style={styles.sectionTitle}>Add New Tree</Text>
-
-        <View style={styles.pickerContainer}>
-          {/* Note: The generic type on Picker is removed to avoid potential Expo Router issues. */}
-          <Picker
-            selectedValue={newTree.treeType}
-            onValueChange={(itemValue) => handleNewTreeChange('treeType', itemValue)}
-            style={styles.picker}
-          >
-            <Picker.Item label="Onsite Tree" value="Onsite" />
-            <Picker.Item label="Adjacent Tree" value="Adjacent" />
-            <Picker.Item label="ROW (Right of Way) Tree" value="ROW" />
-          </Picker>
-        </View>
-        <View style={styles.inputGrid}>
-          <View style={{position: 'relative', width: '100%'}}>
-            <TextInput
-              style={{marginBottom: 0, zIndex: 2}}
-              value={newTree.commonName}
-              onChangeText={(text) => handleNewTreeChange('commonName', text)}
-              title="Common name"
-              onEndEditing={dismissAll}
-            />
-            {suggestions.length > 0 && (
-              <FlatList
-                data={suggestions}
-                style={styles.suggestionList}
-                keyExtractor={(item, index) => index.toString()}
-                nestedScrollEnabled={true}
-                keyboardShouldPersistTaps="handled"
-                renderItem={({ item }) => (
-                  <TouchableOpacity style={styles.suggestionItem} onPress={() => handleAutocomplete(item["Common Name"])}>
-                    <Text style={{fontSize: 16}}>{item["Common Name"]}</Text>
-                  </TouchableOpacity>
-                )}
-              />
-            )}
-          </View>
-        
-          <TextInput
-            value={newTree.species}
-            onChangeText={(text) => handleNewTreeChange('species', text)}
-            title="Species"
-          />
-          <View style={styles.multistemContainer}>
-            <TouchableOpacity onPress={toggleMultistem} style={styles.multistemCheckbox}>
-              <View style={[styles.checkbox, newTree.isMultistem && styles.checkboxChecked]} />
-              <Text style={styles.label}>Multistem Tree?</Text>
-            </TouchableOpacity>
-            {newTree.isMultistem && (
-              <View style={styles.stemInputRow}>
-                <Text style={styles.label}>Stem DSHs:</Text>
-                <View style={styles.stemChips}>
-                  {newTree.stemDSHs.map((dsh, index) => (
-                    <View key={index} style={styles.stemChip}>
-                      <Text style={styles.stemChipText}>{dsh}</Text>
-                      <TouchableOpacity onPress={() => removeStemDSH(index)}>
-                        <Text style={styles.removeChipText}>&times;</Text>
-                      </TouchableOpacity>
-                    </View>
-                  ))}
-                </View>
-                <TextInput
-                  style={styles.stemTextInput}
-                  value={currentStemDSH}
-                  onChangeText={setCurrentStemDSH}
-                  title="Add stem DSH"
-                  keyboardType="numeric"
-                />
-                <TouchableOpacity onPress={addStemDSH} style={styles.addButton}>
-                  <Text style={styles.addButtonText}>Add Stem</Text>
-                </TouchableOpacity>
-              </View>
-            )}
-          </View>
-          <TextInput
-            style={newTree.isMultistem && styles.disabledInput}
-            value={newTree.dsh}
-            onChangeText={(text) => handleNewTreeChange('dsh', text)}
-            title="DSH"
-            keyboardType="numeric"
-            editable={!newTree.isMultistem}
-          />
-          <TextInput
-            value={newTree.dlr}
-            onChangeText={(text) => handleNewTreeChange('dlr', text)}
-            title="DLR"
-            keyboardType="numeric"
-          />
-          <TextInput
-            value={newTree.cond}
-            onChangeText={(text) => handleNewTreeChange('cond', text)}
-            title="Condition"
-          />
-          <TextInput
-            style={styles.disabledInput}
-            value={newTree.tier}
-            onChangeText={(text) => handleNewTreeChange('tier', text)}
-            title="Tier"
-          />
-          <TextInput
-            style={styles.disabledInput}
-            value={newTree.tpz}
-            onChangeText={(text) => handleNewTreeChange('tpz', text)}
-            title="TPZ"
-            editable={false}
-          />
-          <TextInput
-            style={[styles.textInput, styles.disabledInput]}
-            value={newTree.itpz}
-            onChangeText={(text) => handleNewTreeChange('itpz', text)}
-            title="ITPZ"
-            editable={false}
-          />
-          <TextInput
-            style={styles.textInput}
-            value={newTree.retain}
-            onChangeText={(text) => handleNewTreeChange('retain', text)}
-            title="Retain"
-          />
-        </View>
-        
-        
-
-        <TextInput
-          style={[styles.textInput, styles.textArea]}
-          value={newTree.notes}
-          onChangeText={(text) => handleNewTreeChange('notes', text)}
-          title="Tree Notes"
-          multiline
-        />
-        
-        <TouchableOpacity onPress={addTree} style={styles.primaryButton}>
-          <Text style={styles.primaryButtonText}>Add Tree</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Tree Tables */}
-      {renderTreeTable(rowTrees, 'ROW (Right of Way) Trees', 'ROW-')}
-      {renderTreeTable(onsiteTrees, 'Onsite Trees', 'Onsite-')}
-      {renderTreeTable(adjacentTrees, 'Adjacent Trees', 'Adjacent-')}
-
-      {/* Site Notes */}
-      <View style={styles.formGroup}>
-        <TextInput
-          style={[styles.textInput, styles.textArea]}
-          value={siteNotes}
-          onChangeText={setSiteNotes}
-          title="Site Notes"
-          multiline
-        />
-      </View>
-
-      {/* Action Buttons */}
-      <View style={styles.actionButtonsContainer}>
-        <TouchableOpacity onPress={exportToCsv} style={styles.secondaryButton}>
-          <Text style={styles.secondaryButtonText}>Export to CSV</Text>
-        </TouchableOpacity>
-        <TouchableOpacity onPress={generateEmail} style={styles.tertiaryButton}>
-          <Text style={styles.tertiaryButtonText}>Generate Email</Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Email Content Modal */}
-      <Modal
-        animationType="slide"
-        transparent={true}
-        visible={showEmailModal}
-        onRequestClose={() => setShowEmailModal(false)}
+    <View style={styles.backdrop}>
+      <KeyboardAwareScrollView
+        keyboardShouldPersistTaps="handled"
+        nestedScrollEnabled={true}
+        style={styles.card}
+        contentContainerStyle={{ flexGrow: 1 }}
+        extraHeight={80}
+        keyboardOpeningTime={0}
       >
-        <View style={styles.centeredView}>
-          <View style={styles.modalView}>
-            <Text style={styles.modalTitle}>Generated Email Content</Text>
-            <Text style={styles.modalSubText}>
-              Copy the content below and paste it into your email client.
-            </Text>
-            <View style={styles.emailScrollView}>
-              <Text style={styles.emailContentText}>{emailContent}</Text>
-            </View>
-            <View style={styles.modalButtons}>
-              <TouchableOpacity
-                onPress={() => setShowEmailModal(false)}
-                style={styles.modalButton}
-              >
-                <Text style={styles.modalButtonText}>Close</Text>
-              </TouchableOpacity>
-              <TouchableOpacity
-                onPress={copyEmailToClipboard}
-                style={[styles.modalButton, styles.modalCopyButton]}
-              >
-                <Text style={styles.modalCopyButtonText}>Copy Content</Text>
-              </TouchableOpacity>
-            </View>
+        <Pressable onPress={dismissAll} accessible={false}>
+          <Text style={styles.title}>{address === '' ? "Untitled Inventory" : address}</Text>
+          <View style={styles.actionButtonsContainer}>
+            <TouchableOpacity onPress={saveInventory} style={styles.tertiaryButton}>
+              <Text style={styles.tertiaryButtonText}>Save</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={exportToCsv} style={styles.secondaryButton}>
+              <Text style={styles.secondaryButtonText}>Export</Text>
+            </TouchableOpacity>
+            <TouchableOpacity onPress={generateEmail} style={styles.tertiaryButton}>
+              <Text style={styles.tertiaryButtonText}>Email</Text>
+            </TouchableOpacity>
           </View>
-        </View>
-      </Modal>
-    </ScrollView>
-    </TouchableWithoutFeedback>
+          <SiteSettings
+            cityName={cityName}
+            date={date}
+            address={address}
+            searchType={searchType}
+            onChange={(k, v) => {
+              switch (k) {
+                case 'date':
+                  setDate(v);
+                  break;
+                case 'address':
+                  setAddress(v);
+                  break;
+                case 'cityName':
+                  setCityName(v);
+                  break;
+                case 'searchType':
+                  setSearchType(v);
+                  break;
+              }
+              markDirty();
+            }}
+          />
+          {/* Add New Tree Form */}
+          <View style={styles.formContainer}>
+            <Text style={styles.sectionTitle}>Add New Tree</Text>
+
+            <View style={styles.pickerContainer}>
+              {/* Note: The generic type on Picker is removed to avoid potential Expo Router issues. */}
+              <Picker
+                selectedValue={newTree.treeType}
+                mode='dropdown'
+                onValueChange={(itemValue) => handleNewTreeChange('treeType', itemValue)}
+                style={styles.picker}
+              >
+                <Picker.Item label="Onsite Tree" value="Onsite" />
+                <Picker.Item label="Adjacent Tree" value="Adjacent" />
+                <Picker.Item label="ROW (Right of Way) Tree" value="ROW" />
+              </Picker>
+            </View>
+            <View style={styles.inputGrid}>
+              <View style={{ flex: 1, position: 'relative', width: '100%' }}>
+                <TextInput
+                  style={{marginBottom: 0, zIndex: 2}}
+                  value={newTree.search}
+                  onChangeText={(text) => handleNewTreeChange('search', text)}
+                  title={`Search by ${searchType}`}
+                  onEndEditing={dismissAll}
+                />
+                {suggestions.length > 0 && (
+                  <FlatList
+                    data={suggestions}
+                    style={styles.suggestionList}
+                    keyExtractor={(item, index) => index.toString()}
+                    nestedScrollEnabled={true}
+                    keyboardShouldPersistTaps="handled"
+                    renderItem={({ item }) => (
+                      <TouchableOpacity style={styles.suggestionItem} onPress={() => handleAutocomplete(item.item)}>
+                        <Text style={styles.suggestionItemText}>{item.item[searchType]}</Text>
+                      </TouchableOpacity>
+                    )}
+                  />
+                )}
+                <TextInput
+                  style={{marginBottom: 0, zIndex: 2}}
+                  value={newTree.commonName}
+                  onChangeText={(text) => handleNewTreeChange('commonName', text)}
+                  title="Common name"
+                  onEndEditing={dismissAll}
+                />
+              </View>
+      
+              <TextInput
+                value={newTree.species}
+                onChangeText={(text) => handleNewTreeChange('species', text)}
+                title="Scientific Name"
+              />
+              <View style={styles.multistemContainer}>
+                <TouchableOpacity onPress={toggleMultistem} style={styles.multistemCheckbox}>
+                  <View style={[styles.checkbox, newTree.isMultistem && styles.checkboxChecked]} />
+                  <Text style={styles.multistemCheckboxText}>Multistem Tree?</Text>
+                </TouchableOpacity>
+                {newTree.isMultistem && (
+                  <View style={styles.stemInputRow}>
+                    <Text style={styles.label}>Stem DSHs:</Text>
+                    <View style={styles.stemChips}>
+                      {newTree.stemDSHs.map((dsh, index) => (
+                        <View key={index} style={styles.stemChip}>
+                          <Text style={styles.stemChipText}>{dsh}</Text>
+                          <TouchableOpacity onPress={() => removeStemDSH(index)}>
+                            <Text style={styles.removeChipText}>&times;</Text>
+                          </TouchableOpacity>
+                        </View>
+                      ))}
+                    </View>
+                    <TextInput
+                      value={currentStemDSH}
+                      onChangeText={setCurrentStemDSH}
+                      title="Add stem DSH"
+                      keyboardType="numeric"
+                    />
+                    <TouchableOpacity onPress={addStemDSH} style={styles.addButton}>
+                      <Text style={styles.addButtonText}>Add Stem</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+              </View>
+              <TextInput
+                style={newTree.isMultistem && styles.disabledInput}
+                value={newTree.dsh}
+                onChangeText={(text) => handleNewTreeChange('dsh', text)}
+                title="DSH"
+                keyboardType="numeric"
+                editable={!newTree.isMultistem}
+              />
+              <TextInput
+                value={newTree.dlr}
+                onChangeText={(text) => handleNewTreeChange('dlr', text)}
+                title="DLR"
+                keyboardType="numeric"
+              />
+              <TextInput
+                value={newTree.cond}
+                onChangeText={(text) => handleNewTreeChange('cond', text)}
+                title="Condition"
+              />
+              <TextInput
+                style={styles.textInput}
+                value={newTree.retain}
+                onChangeText={(text) => handleNewTreeChange('retain', text)}
+                title="Retain"
+              />
+            </View>
+
+            <TextInput
+              style={[styles.textInput, styles.textArea]}
+              value={newTree.notes}
+              onChangeText={(text) => handleNewTreeChange('notes', text)}
+              title="Tree Notes"
+              multiline
+            />
+      
+            <TouchableOpacity onPress={addTree} style={styles.primaryButton}>
+              <Text style={styles.primaryButtonText}>Add Tree</Text>
+            </TouchableOpacity>
+          </View>
+
+          {/* Tree Tables */}
+          {renderTreeTable(rowTrees, 'ROW (Right of Way) Trees', 'ROW-')}
+          {renderTreeTable(onsiteTrees, 'Onsite Trees', 'Onsite-')}
+          {renderTreeTable(adjacentTrees, 'Adjacent Trees', 'Adjacent-')}
+
+          {/* Site Notes */}
+          <View style={styles.formGroup}>
+            <TextInput
+              style={[styles.textInput, styles.textArea]}
+              value={siteNotes}
+              textAlignVertical='top'
+              onChangeText={setSiteNotes}
+              title="Site Notes"
+              multiline
+            />
+          </View>
+
+          {/* Email Content Modal */}
+          <Modal
+            animationType="slide"
+            transparent={true}
+            visible={showEmailModal}
+            onRequestClose={() => setShowEmailModal(false)}
+          >
+            <View style={styles.centeredView}>
+              <View style={styles.modalView}>
+                <Text style={styles.modalTitle}>Generated Email Content</Text>
+                <Text style={styles.modalSubText}>
+                  Copy the content below and paste it into your email client.
+                </Text>
+                <View style={styles.emailScrollView}>
+                  <Text style={styles.emailContentText}>{emailContent}</Text>
+                </View>
+                <View style={styles.modalButtons}>
+                  <TouchableOpacity
+                    onPress={() => setShowEmailModal(false)}
+                    style={styles.modalButton}
+                  >
+                    <Text style={styles.modalButtonText}>Close</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    onPress={copyEmailToClipboard}
+                    style={[styles.modalButton, styles.modalCopyButton]}
+                  >
+                    <Text style={styles.modalCopyButtonText}>Copy Content</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </View>
+          </Modal>
+          <ToastContainer
+            defaultPosition='bottom'
+          />
+        </Pressable>
+      </KeyboardAwareScrollView>
+    </View>
   );
 };
 
-export default Inventory;
+export default InventoryPage;

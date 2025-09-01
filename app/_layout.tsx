@@ -1,10 +1,9 @@
 import { Stack } from 'expo-router';
-import { SafeAreaView, ScrollView, StatusBar, StyleSheet } from 'react-native';
+import {  StyleSheet } from 'react-native';
 
 const RootLayout = () => {
   return (
     <>
-      <StatusBar barStyle='dark-content' />
       <Stack
         screenOptions={{
           headerShown: false,

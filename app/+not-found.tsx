@@ -9,6 +9,9 @@ export default function NotFoundScreen() {
         <Link href="/" style={styles.button}>
           Go back to Home screen!
         </Link>
+        <Link href="/inventory" style={styles.button}>
+          Go back to Inventory screen!
+        </Link>
       </View>
     </>
   );
